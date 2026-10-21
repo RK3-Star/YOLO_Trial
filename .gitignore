@@ -2,3 +2,6 @@
 __pycache__/ 
 venv/ 
 *.mp4 
+data/ 
+datasets/ 
+runs/ 
