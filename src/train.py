@@ -9,7 +9,10 @@ import yaml
 
 
 def get_dataset_info(data_yaml_path):
-  """Parses data.yaml (local or built-in) to count total images and compute train/val split percentages."""
+  """Parses data.yaml (Roboflow local or Ultralytics built-in) to accurately count images and compute train/val split percentages, correctly resolving '../' paths."""
+  valid_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+  # 1. Resolve YAML location
   try:
     yaml_path = Path(check_file(data_yaml_path))
   except Exception:
@@ -18,19 +21,20 @@ def get_dataset_info(data_yaml_path):
   if not yaml_path.exists():
     return 0, {"train_percentage": 0.0, "test_val_percentage": 0.0}
 
+  # 2. Read configuration file
   with open(yaml_path, "r", encoding="utf-8") as f:
-    data_config = yaml.safe_load(f)
+    data_config = yaml.safe_load(f) or {}
 
   base_dir = yaml_path.parent
   root_setting = data_config.get("path", "")
   global_datasets_dir = Path(
       SETTINGS.get("datasets_dir", Path.home() / "datasets")
   )
-
   dataset_name = Path(data_yaml_path).stem
 
-  # Candidate locations for dataset root (including Ultralytics global datasets directory)
+  # List candidate directories where image subfolders might reside
   candidate_roots = [
+      base_dir,
       global_datasets_dir / dataset_name,
       Path.cwd() / "datasets" / dataset_name,
       (
@@ -39,42 +43,50 @@ def get_dataset_info(data_yaml_path):
           else None
       ),
       (base_dir / root_setting).resolve() if root_setting else None,
-      (Path.cwd() / root_setting).resolve() if root_setting else None,
-      base_dir,
       Path.cwd(),
   ]
+  candidate_roots = [p for p in candidate_roots if p and p.exists()]
 
-  dataset_root = next(
-      (p for p in candidate_roots if p and p.exists()), base_dir
-  )
+  def count_images_for_keys(keys):
+    for key in keys:
+      raw_val = data_config.get(key)
+      if not raw_val:
+        continue
 
-  def resolve_dir(key):
-    rel_path = data_config.get(key, "")
-    if not rel_path:
-      return None
-    p = Path(rel_path)
-    if p.is_absolute():
-      return p
-    if (dataset_root / p).exists():
-      return dataset_root / p
-    if (base_dir / p).exists():
-      return base_dir / p
-    return None
+      paths_to_check = [raw_val] if isinstance(raw_val, str) else raw_val
 
-  train_dir = resolve_dir("train")
-  val_dir = resolve_dir("val")
+      for path_str in paths_to_check:
+        p = Path(path_str)
 
-  valid_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        # Fix Roboflow '../' path issue by stripping leading parent references
+        clean_parts = [part for part in p.parts if part != ".."]
+        clean_rel = Path(*clean_parts) if clean_parts else Path()
 
-  def count_images(directory):
-    if not directory or not directory.exists():
-      return 0
-    return len([
-        f for f in directory.rglob("*") if f.suffix.lower() in valid_extensions
-    ])
+        search_dirs = []
+        if p.is_absolute():
+          search_dirs.append(p)
 
-  train_count = count_images(train_dir)
-  val_count = count_images(val_dir)
+        for root in candidate_roots:
+          search_dirs.extend([
+              root / clean_rel,
+              root / p,
+              root / key,
+              root / key / "images",
+          ])
+
+        for s_dir in search_dirs:
+          if s_dir and s_dir.exists() and s_dir.is_dir():
+            imgs = [
+                f
+                for f in s_dir.rglob("*")
+                if f.suffix.lower() in valid_extensions
+            ]
+            if imgs:
+              return len(imgs)
+    return 0
+
+  train_count = count_images_for_keys(["train"])
+  val_count = count_images_for_keys(["val", "valid", "test"])
   total_size = train_count + val_count
 
   train_pct = (
@@ -92,30 +104,37 @@ def run_training(
     data_yaml,
     epochs=3,
     imgsz=320,
+    fraction=1.0,
     base_model="yolo26n.pt",
     mongo_uri="mongodb://localhost:27017/",
 ):
-  # 1. Connect to MongoDB
   client = MongoClient(mongo_uri)
   db = client["yolo_mongo_db"]
   collection = db["training_results"]
 
-  # 2. Initialize YOLO model
   model = YOLO(base_model)
 
-  # 3. Measure start time and execute training
   start_time = datetime.now()
-  print(f"[Training] Started training on dataset '{data_yaml}' at {start_time}")
+  print(
+      f"[Training] Started training on '{data_yaml}' (fraction={fraction},"
+      f" epochs={epochs}, imgsz={imgsz}) at {start_time}"
+  )
 
-  model.train(data=data_yaml, epochs=epochs, imgsz=imgsz, verbose=True)
+  # Train model with fraction subsampling for fast completion
+  model.train(
+      data=data_yaml,
+      epochs=epochs,
+      imgsz=imgsz,
+      fraction=fraction,
+      verbose=True,
+  )
 
   end_time = datetime.now()
   duration_seconds = round((end_time - start_time).total_seconds(), 2)
 
-  # 4. Extract dataset info post-training (ensures auto-downloaded datasets exist)
+  # Extract dataset metadata post-training
   dataset_size, split_info = get_dataset_info(data_yaml)
 
-  # 5. Extract validation performance metrics
   print("[Validation] Evaluating model metrics on validation split...")
   metrics = model.val()
 
@@ -123,13 +142,11 @@ def run_training(
   recall = float(metrics.box.mr)
   map50 = float(metrics.box.map50)
 
-  # Calculate F1 score: 2 * (Precision * Recall) / (Precision + Recall)
   if (precision + recall) > 0:
     f1_score = round(2 * (precision * recall) / (precision + recall), 4)
   else:
     f1_score = 0.0
 
-  # 6. Format document matching Step D requirements
   log_document = {
       "start_time": start_time,
       "duration_seconds": duration_seconds,
@@ -143,7 +160,6 @@ def run_training(
       },
   }
 
-  # 7. Save document to MongoDB collection 'training_results'
   inserted = collection.insert_one(log_document)
 
   print("\n" + "=" * 60)
@@ -152,7 +168,7 @@ def run_training(
   print(f"Document ID : {inserted.inserted_id}")
   print(f"Start Time  : {start_time}")
   print(f"Duration    : {duration_seconds} seconds")
-  print(f"Dataset Size: {dataset_size} images")
+  print(f"Dataset Size: {dataset_size} total images")
   print(
       f"Split       : {split_info['train_percentage']}% Train /"
       f" {split_info['test_val_percentage']}% Val"
@@ -173,13 +189,19 @@ if __name__ == "__main__":
       "--data",
       type=str,
       required=True,
-      help="Path to data.yaml file or built-in dataset name (e.g. coco8.yaml)",
+      help="Path to data.yaml file or dataset name",
   )
   parser.add_argument(
       "--epochs", type=int, default=3, help="Number of training epochs"
   )
   parser.add_argument(
       "--imgsz", type=int, default=320, help="Image size for training"
+  )
+  parser.add_argument(
+      "--fraction",
+      type=float,
+      default=1.0,
+      help="Fraction of dataset to train on (e.g. 0.05 for 5%)",
   )
   parser.add_argument(
       "--model",
@@ -193,5 +215,6 @@ if __name__ == "__main__":
       data_yaml=args.data,
       epochs=args.epochs,
       imgsz=args.imgsz,
+      fraction=args.fraction,
       base_model=args.model,
   )
