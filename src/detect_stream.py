@@ -18,19 +18,35 @@ The pretrained weights know the 80 COCO classes. classes=[0] keeps only
 "person", which is class 0 in that list. A car or a dog in the same frame
 is ignored. The box drawn on screen is in the original video pixels, even
 though the network itself resizes the frame to imgsz (640 by default).
+
+Runtime flags, all optional:
+  --device           cuda:0, 0, 1, or cpu. auto uses the GPU when it exists.
+  --half             FP16 inference on an NVIDIA GPU. CPU stays FP32.
+  --cudnn-benchmark  time the conv algorithms once for this imgsz.
+  --tensorrt         build or reuse a local .engine and run that.
+  --visualize        draw the boxes. With --tensorrt the window shows the
+                     TensorRT engine output and the frames per second.
+                     --no-visualize still writes person_logs, with no window.
 """
 
 import argparse
 from datetime import datetime
 from pathlib import Path
+import shutil
 import sys
+import time
 import cv2
 from pymongo import MongoClient
 from ultralytics import YOLO
 
+from inference_runtime import configure_runtime
+
 # Detection loads a .pt file from the project root, the same folder train_model.py
 # uses. A version that is not on disk is not offered, so nothing is downloaded.
 PROJECT_DIR = Path(__file__).resolve().parent.parent
+# TensorRT engines are built for one image size and one precision, and they
+# stay in this project. The name records both, so 640 and 320 do not share a file.
+ENGINES_DIR = PROJECT_DIR / "engines"
 
 # A folder passed as --source is searched for these extensions only.
 # A .jpg or .png in that folder is not a stream, so it is left out.
@@ -206,6 +222,59 @@ def select_nano_model(input_value=None):
         print(f"Error: '{choice}' is not in this folder. Enter a number from 1 to {len(files)}.")
 
 
+def _align_imgsz(imgsz):
+    """TensorRT needs a side length that is a multiple of the YOLO stride, 32."""
+    aligned = max(32, int(round(int(imgsz) / 32.0) * 32))
+    if aligned != int(imgsz):
+        print(f"[TensorRT] imgsz {imgsz} adjusted to {aligned} so it matches the model stride of 32.")
+    return aligned
+
+
+def _export_tensorrt(weights, imgsz, device, half):
+    """
+    Load a local TensorRT engine, building it from the .pt file when needed.
+
+    The engine is serialized GPU code. It cannot be built or executed on CPU.
+    A later run with the same weights, imgsz, and precision reuses the file
+    under engines/ instead of exporting again. The first export is slow.
+    """
+    if str(device).lower() == "cpu":
+        raise SystemExit(
+            "[TensorRT] An NVIDIA GPU is required to export and run a .engine file. "
+            "Leave --tensorrt off to run the .pt model on cpu."
+        )
+
+    precision = "fp16" if half else "fp32"
+    destination = ENGINES_DIR / f"{Path(weights).stem}_imgsz{imgsz}_{precision}.engine"
+    if destination.is_file():
+        print(f"[TensorRT] Reusing local engine: {destination}")
+        return destination
+
+    ENGINES_DIR.mkdir(parents=True, exist_ok=True)
+    print(
+        f"[TensorRT] Exporting {Path(weights).name} -> {destination.name} "
+        f"(imgsz={imgsz}, {precision}). The first export can take several minutes."
+    )
+    onnx_path = Path(weights).with_suffix(".onnx")
+    onnx_existed = onnx_path.is_file()
+    model = YOLO(str(weights))
+    try:
+        exported = Path(model.export(format="engine", imgsz=imgsz, device=device, half=half))
+    except Exception as exc:
+        raise SystemExit(
+            "[TensorRT] Export failed. TensorRT has to be installed for this Python, "
+            f"and the GPU has to support it.\n{exc}"
+        ) from exc
+
+    exported = exported.resolve()
+    if exported != destination.resolve():
+        shutil.move(str(exported), destination)
+    if onnx_path.is_file() and not onnx_existed:
+        onnx_path.unlink()
+    print(f"[TensorRT] Saved engine: {destination}")
+    return destination
+
+
 def _sync_box_to_db(box, track_id, model, imgsz, active_tracks, collection, model_name):
     """
     Synchronizes bounding box data and tracking metrics with MongoDB.
@@ -310,6 +379,11 @@ def run_detection(
     reset_db=False,
     clear_on_exit=False,
     mongo_uri="mongodb://localhost:27017/",
+    device="auto",
+    half=False,
+    cudnn_benchmark=False,
+    tensorrt=False,
+    visualize=True,
 ):
     """
     Open the video, run person tracking, draw the boxes, and keep Mongo in sync.
@@ -317,8 +391,14 @@ def run_detection(
     reset_db empties person_logs before the first frame, which is useful when
     a previous run should not mix with this one. clear_on_exit empties it
     again when the window closes. Neither flag touches training_results.
+
+    device, half, and cudnn_benchmark are resolved before the first frame.
+    tensorrt replaces the .pt file with a local .engine for this imgsz.
+    visualize draws that engine's boxes when tensorrt is on, and the PyTorch
+    boxes otherwise. --no-visualize keeps the Mongo writes and skips the window.
     """
     resolved_src = resolve_source(source_input)
+    runtime_device, runtime_half, _cudnn_on = configure_runtime(device, half, cudnn_benchmark)
 
     client = MongoClient(mongo_uri)
     db = client["yolo_mongo_db"]
@@ -329,9 +409,6 @@ def run_detection(
         result = collection.delete_many({})
         print(f"[MongoDB Startup] Cleared {result.deleted_count} existing documents from 'person_logs'.")
 
-    # These are the pretrained COCO weights, not the fine-tuned hardhat run.
-    print(f"[YOLO] Initializing model weights: {model_name}")
-    model = YOLO(model_name)
     # Maps a tracker id to the Mongo _id and the confidence totals for that person.
     active_tracks = {}
 
@@ -355,12 +432,40 @@ def run_detection(
     str_imgsz = str(imgsz_input).strip().lower()
     imgsz = max(width, height) if str_imgsz in ["native", "0", "orig", "none"] else int(imgsz_input)
 
+    # The engine is compiled for one square size, so native video sizes are
+    # rounded to the stride before export. Inference then uses that same size.
+    if tensorrt:
+        imgsz = _align_imgsz(imgsz)
+        try:
+            model_name = str(_export_tensorrt(model_name, imgsz, runtime_device, runtime_half))
+        except SystemExit:
+            cap.release()
+            raise
+
+    # These are the pretrained COCO weights, not the fine-tuned hardhat run,
+    # unless --tensorrt replaced them with an engine built from those weights.
+    print(f"[YOLO] Initializing model weights: {model_name}")
+    print(
+        f"[YOLO] device={runtime_device} half={runtime_half} "
+        f"tensorrt={tensorrt} visualize={visualize}"
+    )
+    model = YOLO(model_name)
+
     # Initialize resizable OpenCV display window
-    window_name = f"YOLO Person Tracking ({model_name} @ imgsz={imgsz}) - {Path(str(resolved_src)).name}"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    runtime_label = "TensorRT" if tensorrt else "PyTorch"
+    window_name = (
+        f"YOLO Person Tracking [{runtime_label}] ({Path(model_name).name} @ imgsz={imgsz}) "
+        f"- {Path(str(resolved_src)).name}"
+    )
+    show_window = visualize
+    if show_window:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        print("[Control] Click display window and press 'q' or Ctrl+C in terminal to stop.\n")
+    else:
+        print("[Control] No window. Press Ctrl+C in the terminal to stop.\n")
 
-    print("[Control] Click display window and press 'q' or Ctrl+C in terminal to stop.\n")
-
+    frame_count = 0
+    fps_total = 0.0
     try:
         # Main stream ingestion and inference loop
         while cap.isOpened():
@@ -374,7 +479,21 @@ def run_detection(
             # the same track_id. Without it, every frame would look like a new
             # person and Mongo would fill with one-frame documents.
             # classes=[0] drops every COCO class except person.
-            results = model.track(frame, persist=True, classes=[0], imgsz=imgsz, verbose=False)
+            # device and half are the resolved runtime, not the raw CLI text.
+            started = time.perf_counter()
+            results = model.track(
+                frame,
+                persist=True,
+                classes=[0],
+                imgsz=imgsz,
+                device=runtime_device,
+                half=runtime_half,
+                verbose=False,
+            )
+            elapsed = time.perf_counter() - started
+            fps = 1.0 / elapsed if elapsed > 0 else 0.0
+            frame_count += 1
+            fps_total += fps
 
             # boxes.id is None on a frame where the detector found people but
             # the tracker has not assigned ids yet. Those boxes are drawn and
@@ -388,13 +507,30 @@ def run_detection(
                     _sync_box_to_db(box, track_id, model, imgsz, active_tracks, collection, model_name)
 
             # plot() draws the box, the class name, and the track id on a copy
-            # of the frame. The original frame is not modified.
-            annotated_frame = results[0].plot(line_width=1, font_size=0.5)
-            cv2.imshow(window_name, annotated_frame)
+            # of the frame. The original frame is not modified. The FPS line is
+            # the TensorRT view when --tensorrt is set, and the PyTorch view
+            # otherwise. --no-visualize skips this and still writes Mongo.
+            if show_window:
+                annotated_frame = results[0].plot(line_width=1, font_size=0.5)
+                cv2.putText(
+                    annotated_frame,
+                    f"{runtime_label} {runtime_device} {'FP16' if runtime_half else 'FP32'}  {fps:.1f} FPS",
+                    (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+                try:
+                    cv2.imshow(window_name, annotated_frame)
+                except cv2.error as exc:
+                    print(f"[Visualize] Could not open a window ({exc}). Continuing without one.")
+                    show_window = False
 
             # waitKey(1) gives the window 1 ms to refresh and reads the keyboard.
             # The mask keeps the low 8 bits, which is the key code for "q".
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            if show_window and cv2.waitKey(1) & 0xFF == ord("q"):
                 print("\n[Exit] Stopped by user ('q').")
                 break
 
@@ -406,6 +542,9 @@ def run_detection(
         if clear_on_exit:
             result = collection.delete_many({})
             print(f"[MongoDB Shutdown] Cleared {result.deleted_count} documents on exit.")
+
+        if frame_count:
+            print(f"[Speed] Average {fps_total / frame_count:.1f} FPS over {frame_count} frames ({runtime_label}).")
 
         cap.release()
         cv2.destroyAllWindows()
@@ -431,6 +570,33 @@ if __name__ == "__main__":
     parser.add_argument("--reset-db", action="store_true", help="Clear MongoDB collection BEFORE running")
     parser.add_argument("--clear-on-exit", action="store_true", help="Clear MongoDB collection AFTER script exits")
     parser.add_argument("--mongo-uri", type=str, default="mongodb://localhost:27017/", help="MongoDB connection URI")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="GPU index (0, 1, cuda:0) or cpu. auto uses cuda:0 when a GPU exists, otherwise cpu.",
+    )
+    parser.add_argument(
+        "--half",
+        action="store_true",
+        help="FP16 inference on an NVIDIA GPU. Halves activation memory and raises throughput. CPU stays FP32.",
+    )
+    parser.add_argument(
+        "--cudnn-benchmark",
+        action="store_true",
+        help="Let cuDNN time convolution algorithms and keep the fastest for this imgsz. GPU only.",
+    )
+    parser.add_argument(
+        "--tensorrt",
+        action="store_true",
+        help="Export the chosen .pt to a local TensorRT .engine, or reuse one, and run inference with it. Requires an NVIDIA GPU.",
+    )
+    parser.add_argument(
+        "--visualize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show the annotated video. With --tensorrt the window is the TensorRT output plus FPS. --no-visualize runs without a window.",
+    )
 
     args = parser.parse_args()
 
@@ -446,4 +612,9 @@ if __name__ == "__main__":
         reset_db=args.reset_db,
         clear_on_exit=args.clear_on_exit,
         mongo_uri=args.mongo_uri,
+        device=args.device,
+        half=args.half,
+        cudnn_benchmark=args.cudnn_benchmark,
+        tensorrt=args.tensorrt,
+        visualize=args.visualize,
     )

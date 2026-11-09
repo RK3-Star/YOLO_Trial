@@ -38,6 +38,8 @@ from pymongo import MongoClient
 from ultralytics import YOLO
 import yaml
 
+from inference_runtime import configure_runtime
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 # This file lives in src/, so the project root is one level up. Weights the
@@ -615,6 +617,9 @@ def run_training(
     object_name="Hardhat",
     reset_db=False,
     clear_on_exit=False,
+    device="auto",
+    half=False,
+    cudnn_benchmark=False,
 ):
     """
     Fine-tune a YOLO checkpoint on one class, score it on the held-out test
@@ -666,6 +671,11 @@ def run_training(
         object_boxes = prepared["object_boxes"]
 
         # Step 3. Start from the nano weights chosen in the menu, then fine-tune them.
+        # device "auto" is cuda:0 when a GPU exists, otherwise cpu.
+        # --half turns on FP16 for the test score. On a GPU, training uses AMP,
+        # which is the training form of 16-bit math. On CPU both stay FP32.
+        # TensorRT is inference-only, so it is a detect_stream.py flag.
+        runtime_device, runtime_half, cudnn_on = configure_runtime(device, half, cudnn_benchmark)
         model = YOLO(base_model)
 
         # Duration covers model.train() only. The test pass below is not included.
@@ -684,14 +694,21 @@ def run_training(
         )
         print(f"[Dataset] Training uses {train_images_used} of {counts['train']} train images (fraction={fraction})")
 
-        model.train(
+        train_kwargs = dict(
             data=train_yaml,
             epochs=epochs,
             imgsz=imgsz,  # 640 unless --imgsz says otherwise
             fraction=fraction,  # shrinks the training split only
             project=str(RUNS_DIR),
+            device=runtime_device,
             verbose=True,
         )
+        # AMP is the training form of 16-bit math. Set it only when --half
+        # resolved to a GPU. Otherwise Ultralytics keeps its own default.
+        if runtime_half:
+            train_kwargs["amp"] = True
+            print("[Half] Training uses automatic mixed precision on this GPU. The test score uses FP16.")
+        model.train(**train_kwargs)
 
         end_time = datetime.now()
         duration_seconds = round((end_time - start_time).total_seconds(), 2)
@@ -701,8 +718,22 @@ def run_training(
 
         # Score the split that was not used to update weights. Training already
         # validates on `val`; this pass is the held-out test result.
+        # name= puts the pictures in runs/detect/test. Ultralytics would
+        # otherwise call that folder val, because val() is the mode name.
         print(f"[Evaluation] Scoring the trained weights on the {eval_split} split...")
-        metrics = model.val(data=train_yaml, split=eval_split, imgsz=imgsz, project=str(RUNS_DIR))
+        metrics = model.val(
+            data=train_yaml,
+            split=eval_split,
+            imgsz=imgsz,
+            project=str(RUNS_DIR),
+            name=eval_split,
+            device=runtime_device,
+            half=runtime_half,
+        )
+        # A second run finds runs/detect/test already there and writes test2.
+        picture_dirs = [path for path in RUNS_DIR.glob(f"{eval_split}*") if path.is_dir()]
+        picture_dir = max(picture_dirs, key=lambda path: path.stat().st_mtime) if picture_dirs else RUNS_DIR / eval_split
+        print(f"[Evaluation] Test pictures: {picture_dir}")
 
         # All four numbers come from the test split, not from the validation
         # pass that ran inside model.train().
@@ -751,6 +782,9 @@ def run_training(
             "weights_path": str(saved_weights),  # stable copy under models/
             "epochs": epochs,  # full passes over the training images
             "imgsz": imgsz,  # square side used for train and for the test score
+            "device": runtime_device,  # "cpu" or the CUDA index that ran the job
+            "half": runtime_half,  # True when the test score ran in FP16
+            "cudnn_benchmark": cudnn_on,  # True when cuDNN timed conv algorithms
             "classes": info["classes"],  # ["Hardhat"] after the one-class filter
             "dataset_url": info["dataset_url"],  # Roboflow page the export came from
             "training_results": {
@@ -805,6 +839,22 @@ if __name__ == "__main__":
     parser.add_argument("--reset-db", action="store_true", help="Delete every document in training_results before training starts.")
     parser.add_argument("--clear-on-exit", action="store_true", help="Delete every document in training_results after the run is saved and printed.")
     parser.add_argument("--mongo-uri", type=str, default="mongodb://localhost:27017/", help="MongoDB URI")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="GPU index (0, 1, cuda:0) or cpu. auto uses cuda:0 when a GPU exists, otherwise cpu.",
+    )
+    parser.add_argument(
+        "--half",
+        action="store_true",
+        help="FP16 for the test score on an NVIDIA GPU, and AMP during training. CPU stays FP32.",
+    )
+    parser.add_argument(
+        "--cudnn-benchmark",
+        action="store_true",
+        help="Let cuDNN time convolution algorithms and keep the fastest for this imgsz. GPU only.",
+    )
 
     args = parser.parse_args()
     # Menus run first. A valid --model / --object skips its question.
@@ -821,4 +871,7 @@ if __name__ == "__main__":
         object_name=chosen_object,
         reset_db=args.reset_db,
         clear_on_exit=args.clear_on_exit,
+        device=args.device,
+        half=args.half,
+        cudnn_benchmark=args.cudnn_benchmark,
     )

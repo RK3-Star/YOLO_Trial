@@ -1,7 +1,10 @@
 *.pt 
+*.engine
+*.onnx
 __pycache__/ 
 venv/ 
 *.mp4 
 data/ 
 datasets/ 
 runs/ 
+engines/ 
